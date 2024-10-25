@@ -20,7 +20,7 @@
 #define DATA_LENGHT sizeof(int) * 3
 
 static esp_err_t i2c_master_init();
-static esp_err_t i2c_master_read_register(uint8_t reg, uint8_t *data,
+static esp_err_t i2c_master_read_register(i2c_master_dev_handle_t periph, uint8_t *reg, uint8_t *data,
                                           size_t len);
 static esp_err_t i2c_master_write_register(uint8_t reg_addr,
                                            const uint8_t *data, uint32_t len,
@@ -32,32 +32,43 @@ int8_t rslt;
 uint32_t period;
 
 static const char *TAG = "ESP";
-i2c_master_dev_handle_t master_handler;
+i2c_master_dev_handle_t esp32_periph;
 i2c_master_bus_handle_t master_bus_handler;
 
 i2c_device_config_t dev_cfg = {
-    .dev_addr_length = 7,
+    .dev_addr_length = I2C_ADDR_BIT_7,
     .device_address = ESP32_SLAVE_ADDR,
     .scl_speed_hz = I2C_MASTER_FREQ_HZ,
 };
 
 static void read_esp32_slave_task(void *pvParameters) {
-  int aux_data[3] = {0};
-
+  uint8_t aux_data[3] = {0};
+  uint8_t reg[2] = {0x27,0x9F};
   while (1) {
-    esp_err_t err = i2c_master_receive(master_handler, (uint8_t *)aux_data,
-                                       sizeof(int) * 3, -1);
-    if (err != ESP_OK)
+    reg[0] = 0x27; reg[1]=0x9F;
+    esp_err_t err = i2c_master_read_register(esp32_periph, reg, aux_data, 1);
+    if (err != ESP_OK){
       ESP_LOGE("i2cD", "Trouble reading esp32");
-    ESP_LOGI(TAG, "Temp: %d C, Presión: %d hPa, Humedad: %d %%", aux_data[0],
-             aux_data[1], aux_data[2]);
-    vTaskDelay(2000 / portTICK_PERIOD_MS);
+    }
+    ESP_LOGI(TAG, "Temp: %d C", aux_data[0]);
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    reg[0] = 0x28; reg[1]=0x99;
+    err = i2c_master_read_register(esp32_periph, reg, aux_data, 1);
+    if (err != ESP_OK){
+      ESP_LOGE("i2cD", "Trouble reading esp32");
+    }
+    ESP_LOGI(TAG, "Temp: %d C", aux_data[0]);
+    
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
   }
 }
-
+void init_slave_stuff(){
+  
+}
 void app_main() {
-  ESP_ERROR_CHECK(i2c_master_init());
-  xTaskCreate(read_esp32_slave_task, "esp32R", 4096, NULL, 5, NULL);
+  // ESP_ERROR_CHECK(i2c_master_init());
+  
+  // xTaskCreate(read_esp32_slave_task, "esp32R", 4096, NULL, 5, NULL);
   while (1) {
     vTaskDelay(10000 / portTICK_PERIOD_MS);
     ESP_LOGI("Main", "Working...");
@@ -76,35 +87,29 @@ static esp_err_t i2c_master_init() {
   if (err != ESP_OK)
     return err;
   err =
-      i2c_master_bus_add_device(master_bus_handler, &dev_cfg, &master_handler);
+      i2c_master_bus_add_device(master_bus_handler, &dev_cfg, &esp32_periph);
+      
   return err;
 }
 
-static esp_err_t i2c_master_read_register(uint8_t reg, uint8_t *data,
-                                          size_t len) {
-  // ESP_ERROR_CHECK(
-  //     i2c_master_bus_add_device(master_bus_handler, &dev_cfg,
-  //     &master_handler));
-  esp_err_t err = i2c_master_transmit_receive(master_handler, &reg, sizeof(reg),
-                                              data, len, -1);
+static esp_err_t i2c_master_read_register(i2c_master_dev_handle_t periph, uint8_t* reg, uint8_t *data, size_t len) {
+  esp_err_t err = i2c_master_transmit_receive(periph, reg, sizeof(reg), data, len, 500);
   if (err != ESP_OK)
     return err;
-  // err = i2c_master_bus_rm_device(master_handler);
-  return err;
+  // err = i2c_master_bus_rm_device(esp32_periph);
+  return ESP_OK;
 }
 
-static esp_err_t i2c_master_write_register(uint8_t reg_addr,
-                                           const uint8_t *data, uint32_t len,
-                                           void *intf_ptr) {
+static esp_err_t i2c_master_write_register(uint8_t reg_addr, const uint8_t *data, uint32_t len, void *intf_ptr) {
   esp_err_t err;
   uint8_t *i2c_data = malloc(len * sizeof(uint8_t) + 1);
-  memcpy(i2c_data, data, len);
-  i2c_data[len] = reg_addr;
+  memcpy(i2c_data+1, data, len);
+  i2c_data[0] = reg_addr;
   //  ESP_ERROR_CHECK(
   //     i2c_master_bus_add_device(master_bus_handler, &dev_cfg,
-  //     &master_handler));
-  err = i2c_master_transmit(master_handler, i2c_data, len + 2, -1);
-  // i2c_master_bus_rm_device(master_handler);
+  //     &esp32_periph));
+  err = i2c_master_transmit(esp32_periph, i2c_data, len + 1, -1);
+  // i2c_master_bus_rm_device(esp32_periph);
   free(i2c_data);
   return err;
 }

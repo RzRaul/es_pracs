@@ -14,10 +14,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define I2C_MASTER_SCL_IO 22
-#define I2C_MASTER_SDA_IO 21
+#define I2C_MASTER_SCL_IO GPIO_NUM_22
+#define I2C_MASTER_SDA_IO GPIO_NUM_21
 #define I2C_MASTER_NUM I2C_NUM_0
-#define I2C_MASTER_FREQ_HZ 1000000
+#define I2C_MASTER_FREQ_HZ 100000
+#define I2C_SALVE_SDA_IO GPIO_NUM_32
+#define I2C_SALVE_SCL_IO GPIO_NUM_33
 #define BME280_ADDR 0x77
 #define BME280_ADDR_ID 0xD0
 #define SAMPLE_COUNT UINT8_C(5)
@@ -55,38 +57,80 @@ typedef struct {
   uint8_t dev_addr;
 } i2c_package_t;
 
-bme280_data data;
+bme280_data bme_data;
 
 static const char *TAG = "BME280";
+QueueHandle_t s_receive_queue;
 i2c_slave_dev_handle_t slave_handler;
-i2c_master_dev_handle_t master_handler;
+i2c_master_dev_handle_t bme280_dev;
 i2c_master_bus_handle_t master_bus_handler;
 
 i2c_device_config_t dev_cfg = {
-    .dev_addr_length = 7,
+    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
     .device_address = BME280_ADDR,
     .scl_speed_hz = I2C_MASTER_FREQ_HZ,
 };
+static IRAM_ATTR bool i2c_slave_rx_done_callback(i2c_slave_dev_handle_t channel, const i2c_slave_rx_done_event_data_t *edata, void *user_data)
+{
+    BaseType_t high_task_wakeup = pdFALSE;
+    QueueHandle_t receive_queue = (QueueHandle_t)user_data;
+    xQueueSendFromISR(receive_queue, edata, &high_task_wakeup);
+    return high_task_wakeup == pdTRUE;
+}
+
+static void listen_bus_and_transmit(void * pvParameters){
+    i2c_slave_rx_done_event_data_t rx_data;
+    uint8_t data_rd[2] ={0};
+    int aux_data[3] = {0};
+    while(1){
+      ESP_ERROR_CHECK(i2c_slave_receive(slave_handler, data_rd, 2));
+      xQueueReceive(s_receive_queue, &rx_data, portMAX_DELAY);
+      ESP_LOGI(TAG, "Received data: %x %x", rx_data.buffer[0], rx_data.buffer[1]);
+      //Logs the data in hex
+      if (data_rd[0] ==0x27 && data_rd[1] == 0x9F){
+        rslt = bme280_set_sensor_mode(BME280_POWERMODE_FORCED, &dev);
+        if (rslt != BME280_OK) {
+          ESP_LOGE(TAG, "Error setting sensor mode: %d", rslt);
+        }
+        rslt = bme280_get_sensor_data(BME280_ALL, &bme_data, &dev);
+        if (rslt != BME280_OK) {
+          ESP_LOGE(TAG, "Error setting sensor mode: %d", rslt);
+        }
+        aux_data[0] =bme_data.temperature;
+        aux_data[1] =bme_data.pressure / 1000;
+        aux_data[2] =bme_data.humidity;
+        i2c_slave_transmit(slave_handler, aux_data, 1, 500);
+        ESP_LOGI(TAG, "Temp %.2f C, Presión %.2f hPa, Humedad %.2f %%", bme_data.temperature,
+              bme_data.pressure, bme_data.humidity);
+      }
+    }
+}
 
 static void bme280_task(void *pvParameters) {
   float temperature, pressure, humidity;
   int aux_data[3] = {0};
-  rslt = bme280_set_sensor_mode(BME280_POWERMODE_FORCED, &dev);
-  rslt = bme280_get_sensor_data(BME280_ALL, &data, &dev);
-  vTaskDelay(1000 / portTICK_PERIOD_MS);
   printRegs();
+  rslt = bme280_set_sensor_mode(BME280_POWERMODE_FORCED, &dev);
+  rslt = bme280_get_sensor_data(BME280_ALL, &bme_data, &dev);
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+  // printRegs();
 
   while (1) {
 
     rslt = bme280_set_sensor_mode(BME280_POWERMODE_FORCED, &dev);
-    rslt = bme280_get_sensor_data(BME280_ALL, &data, &dev);
-    temperature = data.temperature;
-    pressure = data.pressure;
-    humidity = data.humidity;
-    aux_data[0] = temperature;
-    aux_data[1] = pressure;
-    aux_data[2] = humidity;
-    i2c_slave_transmit(slave_handler, aux_data, DATA_LENGHT, 1000);
+    if (rslt != BME280_OK) {
+      ESP_LOGE(TAG, "Error setting sensor mode: %d", rslt);
+    }
+    rslt = bme280_get_sensor_data(BME280_ALL, &bme_data, &dev);
+    if (rslt != BME280_OK) {
+      ESP_LOGE(TAG, "Error setting sensor mode: %d", rslt);
+    }
+    aux_data[0] =bme_data.temperature;
+    aux_data[1] =bme_data.pressure / 1000;
+    aux_data[2] =bme_data.humidity;
+    i2c_slave_transmit(slave_handler, aux_data, sizeof(aux_data), 100);
+    ESP_LOGI(TAG, "Temp %.2f C, Presión %.2f hPa, Humedad %.2f %%", bme_data.temperature,
+             bme_data.pressure, bme_data.humidity);
     ESP_LOGI(TAG, "Temp: %d C, Presión: %d hPa, Humedad: %d %%", aux_data[0],
              aux_data[1], aux_data[2]);
     vTaskDelay(2000 / portTICK_PERIOD_MS);
@@ -95,23 +139,34 @@ static void bme280_task(void *pvParameters) {
 
 esp_err_t init_slave_mode() {
   esp_err_t err;
+  uint8_t *data_rd = (uint8_t *) malloc(3);
+  uint32_t size_rd = 0;
   i2c_slave_config_t i2c_slave_conf = {
+    .addr_bit_len = I2C_ADDR_BIT_LEN_7,
       .i2c_port = I2C_NUM_0, // Autoselect
       .slave_addr = 0x26,
-      .scl_io_num = GPIO_NUM_12,
-      .sda_io_num = GPIO_NUM_14,
+      .scl_io_num = I2C_SALVE_SCL_IO,
+      .sda_io_num = I2C_SALVE_SDA_IO,
       .clk_source = I2C_CLK_SRC_DEFAULT,
       .send_buf_depth = 256,
   };
   err = (i2c_new_slave_device(&i2c_slave_conf, &slave_handler));
+  s_receive_queue = xQueueCreate(3, sizeof(i2c_slave_rx_done_event_data_t));
+  i2c_slave_event_callbacks_t cbs = {
+      .on_recv_done = i2c_slave_rx_done_callback,
+  };
+  ESP_ERROR_CHECK(i2c_slave_register_event_callbacks(slave_handler, &cbs, s_receive_queue));
+
+  
   return err;
 }
 
 void app_main() {
   ESP_ERROR_CHECK(i2c_master_init());
-  ESP_ERROR_CHECK(init_slave_mode());
-  bme280_initialize();
-  xTaskCreate(bme280_task, "bme280_task", 4096, NULL, 5, NULL);
+  // ESP_ERROR_CHECK(init_slave_mode());
+  // bme280_initialize();
+  // xTaskCreate(bme280_task, "bme280_task", 4096, NULL, 5, NULL);
+  // xTaskCreate(listen_bus_and_transmit, "listen_bus_and_transmit", 4096, NULL, 5, NULL);
   while (1) {
     vTaskDelay(10000 / portTICK_PERIOD_MS);
     ESP_LOGI("Main", "Working...");
@@ -125,40 +180,32 @@ static esp_err_t i2c_master_init() {
       .scl_io_num = I2C_MASTER_SCL_IO,
       .sda_io_num = I2C_MASTER_SDA_IO,
       .flags.enable_internal_pullup = true,
+      .glitch_ignore_cnt = 7,
   };
   esp_err_t err = i2c_new_master_bus(&conf, &master_bus_handler);
   if (err != ESP_OK)
     return err;
   err =
-      i2c_master_bus_add_device(master_bus_handler, &dev_cfg, &master_handler);
+      i2c_master_bus_add_device(master_bus_handler, &dev_cfg, &bme280_dev);
   return err;
 }
 
-static esp_err_t i2c_master_read_register(uint8_t reg, uint8_t *data,
-                                          size_t len) {
-  // ESP_ERROR_CHECK(
-  //     i2c_master_bus_add_device(master_bus_handler, &dev_cfg,
-  //     &master_handler));
-  esp_err_t err = i2c_master_transmit_receive(master_handler, &reg, sizeof(reg),
-                                              data, len, -1);
+static esp_err_t i2c_master_read_register(uint8_t reg, uint8_t *data, size_t len) {
+  bzero(data, len);
+  esp_err_t err = i2c_master_transmit_receive(bme280_dev, &reg, sizeof(reg), data, len, 100);
   if (err != ESP_OK)
     return err;
-  // err = i2c_master_bus_rm_device(master_handler);
   return err;
 }
 
-static esp_err_t i2c_master_write_register(uint8_t reg_addr,
-                                           const uint8_t *data, uint32_t len,
-                                           void *intf_ptr) {
+static esp_err_t i2c_master_write_register(uint8_t reg_addr, const uint8_t *data, uint32_t len, void *intf_ptr) {
   esp_err_t err;
   uint8_t *i2c_data = malloc(len * sizeof(uint8_t) + 1);
-  memcpy(i2c_data, data, len);
-  i2c_data[len] = reg_addr;
-  //  ESP_ERROR_CHECK(
-  //     i2c_master_bus_add_device(master_bus_handler, &dev_cfg,
-  //     &master_handler));
-  err = i2c_master_transmit(master_handler, i2c_data, len + 2, -1);
-  // i2c_master_bus_rm_device(master_handler);
+  memcpy(i2c_data+1, data, len);
+  i2c_data[0] = reg_addr;
+  //prints the hex of the data is sending, including the register
+  
+  err = i2c_master_transmit(bme280_dev, i2c_data, len + 1, portMAX_DELAY);
   free(i2c_data);
   return err;
 }
