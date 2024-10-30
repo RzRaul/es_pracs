@@ -9,6 +9,7 @@
 */
 
 #include "esp_vfs_fat.h"
+#include "freertos/idf_additions.h"
 #include "myUart.h"
 #include "sdmmc_cmd.h"
 #include <string.h>
@@ -28,6 +29,8 @@ static const char *TAG = "sd_card";
 #define PIN_NUM_MOSI GPIO_NUM_23
 #define PIN_NUM_CLK GPIO_NUM_18
 #define PIN_NUM_CS GPIO_NUM_5
+
+esp_err_t init_spi_sd();
 
 #define is_digit(c) ((c) >= '0' && (c) <= '9')
 #define is_alpha(c) (((c) >= 'a' && (c) <= 'z') || ((c) >= 'A' && (c) <= 'Z'))
@@ -98,19 +101,17 @@ static esp_err_t sd_read_file(const char *path) {
 }
 
 #define CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED
+#define INPUT_READY_BIT (1 << 0)
+
+EventGroupHandle_t input_group;
 
 void app_main(void) {
+  init_spi_sd();
+  EventBits_t event_bits;
 
-  init_uart();
-  ESP_LOGI("TEST", "Iniciando tarea de lectura de consola");
-  for (int i = 0; i < 5; i++) {
-    decompress_text_recursive(CONSOLE_UART, test[i], 1);
-    uart_puts(CONSOLE_UART, "\n");
-  }
-  while (1) {
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-  }
-  // init_spi_sd();
+  xTaskCreate(task_reading_console, "Reading task", NULL, 1024, (void *)NULL,
+              NULL, NULL);
+
   // Options for mounting the filesystem.
   // If format_if_mount_failed is set to true, SD card will be partitioned and
   // formatted in case when mounting fails.
@@ -126,6 +127,7 @@ void task_reading_console(void *pvParameters) {
     if (strncmp(buffer, "exit", 4) == 0) {
       break;
     }
+    xQueueSend(xQueue, pvItemToQueue, xTicksToWait)
   }
   vTaskDelete(NULL);
 }
