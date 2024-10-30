@@ -50,19 +50,6 @@ typedef enum{
     STATE_IN_TEXT,
 }repeater_state_t;
 
-typedef struct {
-    uint16_t repetitions;
-    char *text_to_repeat;
-    uint8_t text_to_repeat_size;
-    repeater_state_t state;
-}repeater_handle_t;
-
-repeater_handle_t decompresser = {
-    .repetitions = 0,
-    .text_to_repeat = NULL,
-    .text_to_repeat_size = 0,
-    .state = STATE_IDLE
-};
 
 static esp_err_t s_example_write_file(const char *path, char *data)
 {

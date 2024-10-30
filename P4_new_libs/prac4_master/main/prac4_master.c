@@ -14,10 +14,11 @@
 #define I2C_MASTER_SCL_IO 22
 #define I2C_MASTER_SDA_IO 21
 #define I2C_MASTER_NUM I2C_NUM_0
-#define I2C_MASTER_FREQ_HZ 1000000
-#define ESP32_SLAVE_ADDR 0x26
+#define I2C_MASTER_FREQ_HZ 200000
+#define ESP32_SLAVE_ADDR 0x28
 #define SAMPLE_COUNT UINT8_C(5)
 #define DATA_LENGHT sizeof(int) * 3
+#define DATA_LENGTH_TEST 10
 
 static esp_err_t i2c_master_init();
 static esp_err_t i2c_master_read_register(i2c_master_dev_handle_t periph, uint8_t *reg, uint8_t *data,
@@ -39,39 +40,31 @@ i2c_device_config_t dev_cfg = {
     .dev_addr_length = I2C_ADDR_BIT_7,
     .device_address = ESP32_SLAVE_ADDR,
     .scl_speed_hz = I2C_MASTER_FREQ_HZ,
+    .scl_wait_us = 12000,
 };
 
 static void read_esp32_slave_task(void *pvParameters) {
   uint8_t aux_data[3] = {0};
   uint8_t reg[2] = {0x27,0x9F};
   while (1) {
-    reg[0] = 0x27; reg[1]=0x9F;
-    esp_err_t err = i2c_master_read_register(esp32_periph, reg, aux_data, 1);
+    memset(aux_data, 0, sizeof(aux_data));
+    esp_err_t err = i2c_master_transmit_receive(esp32_periph, reg, 2, aux_data, 3, -1);
     if (err != ESP_OK){
       ESP_LOGE("i2cD", "Trouble reading esp32");
     }
-    ESP_LOGI(TAG, "Temp: %d C", aux_data[0]);
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-    reg[0] = 0x28; reg[1]=0x99;
-    err = i2c_master_read_register(esp32_periph, reg, aux_data, 1);
-    if (err != ESP_OK){
-      ESP_LOGE("i2cD", "Trouble reading esp32");
-    }
-    ESP_LOGI(TAG, "Temp: %d C", aux_data[0]);
-    
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    err = i2c_master_bus_wait_all_done(master_bus_handler, -1);
+    ESP_LOGI(TAG, "Temp: %d Hum: %d Pres: %d", aux_data[0], aux_data[1], aux_data[2]);
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+
   }
 }
-void init_slave_stuff(){
-  
-}
 void app_main() {
-  // ESP_ERROR_CHECK(i2c_master_init());
+  ESP_ERROR_CHECK(i2c_master_init());
   
-  // xTaskCreate(read_esp32_slave_task, "esp32R", 4096, NULL, 5, NULL);
+  xTaskCreate(read_esp32_slave_task, "esp32R", 4096, NULL, NULL, NULL);
   while (1) {
     vTaskDelay(10000 / portTICK_PERIOD_MS);
-    ESP_LOGI("Main", "Working...");
+    // ESP_LOGI("Main", "Working...");
   }
 }
 
@@ -82,6 +75,7 @@ static esp_err_t i2c_master_init() {
       .scl_io_num = I2C_MASTER_SCL_IO,
       .sda_io_num = I2C_MASTER_SDA_IO,
       .flags.enable_internal_pullup = true,
+      .glitch_ignore_cnt = 7,
   };
   esp_err_t err = i2c_new_master_bus(&conf, &master_bus_handler);
   if (err != ESP_OK)
@@ -93,9 +87,12 @@ static esp_err_t i2c_master_init() {
 }
 
 static esp_err_t i2c_master_read_register(i2c_master_dev_handle_t periph, uint8_t* reg, uint8_t *data, size_t len) {
-  esp_err_t err = i2c_master_transmit_receive(periph, reg, sizeof(reg), data, len, 500);
-  if (err != ESP_OK)
+  esp_err_t err = i2c_master_transmit_receive(periph, reg, sizeof(reg), data, len, -1);
+  if (err == ESP_ERR_TIMEOUT) ESP_LOGE("i2cD", "Timeout reading esp32");
+  if (err != ESP_OK) {
+    ESP_LOGE("i2cD", "Error reading esp32");
     return err;
+  }
   // err = i2c_master_bus_rm_device(esp32_periph);
   return ESP_OK;
 }
