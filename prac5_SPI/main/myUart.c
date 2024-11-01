@@ -39,6 +39,9 @@ void uart_reads(uint8_t uartNum, char *buf, int max_len, bool verbose){
     while(1){
         c = uart_readchar(uartNum);
         if(c == '\n' || c == '\r'){
+            if (verbose){
+                uart_putchar(uartNum, c);
+            }
             break;
         }
         if(c == 127 || c == 8){ //Bakspace or Delete

@@ -44,17 +44,17 @@ i2c_device_config_t dev_cfg = {
 };
 
 static void read_esp32_slave_task(void *pvParameters) {
-  uint8_t aux_data[3] = {0};
+  uint8_t aux_data[5] = {0};
   uint8_t reg[2] = {0x27,0x9F};
   while (1) {
     memset(aux_data, 0, sizeof(aux_data));
-    esp_err_t err = i2c_master_transmit_receive(esp32_periph, reg, 2, aux_data, 3, -1);
+    esp_err_t err = i2c_master_transmit_receive(esp32_periph, reg, 2, aux_data, 5, -1);
     if (err != ESP_OK){
       ESP_LOGE("i2cD", "No response after 2 tries");
       break;
     }
     err = i2c_master_bus_wait_all_done(master_bus_handler, -1);
-    ESP_LOGI(TAG, "Temp: %d Press: 100%d Hum: %d%%", aux_data[0], aux_data[1], aux_data[2]);
+    ESP_LOGI(TAG, "Header: x%x CMD: x%x Temp: %d Press: 100%d Hum: %d%%", aux_data[0], aux_data[1], aux_data[2], aux_data[3], aux_data[4]);
     vTaskDelay(2000 / portTICK_PERIOD_MS);
 
   }

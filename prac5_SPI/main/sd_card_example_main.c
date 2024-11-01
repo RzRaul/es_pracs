@@ -30,20 +30,27 @@ static const char *TAG = "sd_card";
 #define PIN_NUM_CLK GPIO_NUM_18
 #define PIN_NUM_CS GPIO_NUM_5
 
-esp_err_t init_spi_sd();
+
 
 #define is_digit(c) ((c) >= '0' && (c) <= '9')
 #define is_alpha(c) (((c) >= 'a' && (c) <= 'z') || ((c) >= 'A' && (c) <= 'Z'))
+
 char *decompress_text_recursive(uint8_t, char *, uint8_t);
+void task_reading_console(void *pvParameters);
+esp_err_t create_test_files();
+esp_err_t init_spi_sd();
+
+#define TEST_FILE_1 "AB[3CD]"
+#define TEST_FILE_2 "AB[2C[2EF]G]"
+#define TEST_FILE_3 "IF[2A]LG[5M]D"
+#define TEST_FILE_4 "[2AB]RA[15UAB[2CD[2JS[4RUST]2ABC]3GLEAM[5T]]E]Z"
 
 #define CHAR_INIT_GROUP '['
 #define CHAR_END_GROUP ']'
 
-char *test[5] = {"ABCDE", "AB[12C]DE", "AB[3CD]", "AB[2C[2EF]G]",
-                 "IF[2A]LG[5M]D"};
-
 char filename[MAX_CHAR_SIZE] = {0};
 const char mount_point[] = MOUNT_POINT;
+
 sdmmc_card_t *card;
 sdmmc_host_t host = SDSPI_HOST_DEFAULT();
 
@@ -85,44 +92,78 @@ static esp_err_t sd_read_file(const char *path) {
     *pos = '\0';
   }
   ESP_LOGI(TAG, "Lectura de archivo: '%s'", line);
-
+  ESP_LOGI(TAG, "Descomprimiendo texto...");
+  decompress_text_recursive(CONSOLE_UART, line, 1);
   return ESP_OK;
 }
 
 #define CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED
-#define INPUT_READY_BIT (1 << 0)
+#define BIT_INPUT_READY BIT0
+#define BIT_OUTPUT_READY BIT1
+#define BIT_EXIT BIT2
 
 EventGroupHandle_t input_group;
 
 void app_main(void) {
   init_spi_sd();
+  init_uart();
   EventBits_t event_bits;
-
-  xTaskCreate(task_reading_console, "Reading task", NULL, 1024, (void *)NULL,
+  input_group = xEventGroupCreate();
+  create_test_files();
+  xTaskCreate(task_reading_console, "Reading task", 1024, (void *)NULL,
               NULL, NULL);
+  while(1){
+    event_bits = xEventGroupWaitBits(input_group, BIT_INPUT_READY|BIT_EXIT, pdTRUE, pdFALSE,
+                                    portMAX_DELAY);
+    if(event_bits & BIT_EXIT){
+      // All done, unmount partition and disable SPI peripheral
+      esp_vfs_fat_sdcard_unmount(mount_point, card);
+      ESP_LOGI(TAG, "Tarjeta desmontada");
 
-  // Options for mounting the filesystem.
-  // If format_if_mount_failed is set to true, SD card will be partitioned and
-  // formatted in case when mounting fails.
-  // The partition will be FAT16 with 1 sector size
+      //deinitialize the bus after all devices are removed
+      spi_bus_free(host.slot);
+      break;
+    }
+    if(event_bits & BIT_INPUT_READY){
+      ESP_LOGI(TAG, "Archivo a leer: %s", filename);
+    }
+    
+      // Check if destination file exists, if not, cant read it
+      struct stat st;
+      if (stat(filename, &st) == 0) {
+        // Read file
+        sd_read_file(filename);
+        xEventGroupSetBits(input_group, BIT_OUTPUT_READY);
+      } else {
+        ESP_LOGE(TAG, "Archivo no encontrado");
+        xEventGroupSetBits(input_group, BIT_OUTPUT_READY);
+        continue;
+      }
+  }
+  vTaskDelete(NULL);
 }
 
 void task_reading_console(void *pvParameters) {
   char buffer[MAX_CHAR_SIZE];
 
   while (1) {
-    uart_puts(CONSOLE_UART, "Ingrese el nombre del archivo a leer: ");
+    uart_puts(CONSOLE_UART, "\nIngrese el nombre del archivo a leer: ");
     uart_reads(CONSOLE_UART, buffer, MAX_CHAR_SIZE, true);
     if (strncmp(buffer, "exit", 4) == 0) {
+      xEventGroupSetBits(input_group, BIT_EXIT);
       break;
     }
-    xQueueSend(xQueue, pvItemToQueue, xTicksToWait)
+    strncpy(filename+strlen(MOUNT_POINT)+1, buffer, 64 - strlen(MOUNT_POINT));
+    xEventGroupSetBits(input_group, BIT_INPUT_READY);
+    xEventGroupWaitBits(input_group, BIT_OUTPUT_READY, pdTRUE, pdFALSE, portMAX_DELAY);
   }
   vTaskDelete(NULL);
 }
 
 esp_err_t init_spi_sd() {
   esp_err_t ret;
+  memcpy(filename, MOUNT_POINT, strlen(MOUNT_POINT));
+  strcat(filename, "/");
   esp_vfs_fat_sdmmc_mount_config_t mount_config = {
       .format_if_mount_failed = true,
       .max_files = 5,
@@ -188,45 +229,38 @@ esp_err_t init_spi_sd() {
   return ret;
 }
 
-// esp_err_t create_file(){
-//     // First create a file.
-//     esp_err_t ret;
-//     const char *file_hello = MOUNT_POINT"/hello.txt";
-//     char data[MAX_CHAR_SIZE];
-//     snprintf(data, MAX_CHAR_SIZE, "%s %s!\n", "Hola", card->cid.name);
-//     ret = s_example_write_file(file_hello, data);
-//     if (ret != ESP_OK) {
-//         return;
-//     }
+esp_err_t create_test_files(){
+    // First create a file.
+    esp_err_t ret;
+    const char *file_hello = MOUNT_POINT"/test1.txt";
+    ret = s_example_write_file(file_hello, TEST_FILE_1);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    const char *file_hello2 = MOUNT_POINT"/test2.txt";
+    ret = s_example_write_file(file_hello2, TEST_FILE_2);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    const char *file_hello3 = MOUNT_POINT"/test3.txt";
+    ret = s_example_write_file(file_hello3, TEST_FILE_3);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    const char *file_hello4 = MOUNT_POINT"/test4.txt";
+    ret = s_example_write_file(file_hello4, TEST_FILE_4);
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
-//     const char *file_foo = MOUNT_POINT"/foo.txt";
+    // All done, unmount partition and disable SPI peripheral
+    // esp_vfs_fat_sdcard_unmount(mount_point, card);
+    // ESP_LOGI(TAG, "Tarjeta desmontada");
 
-//     // Check if destination file exists before renaming
-//     struct stat st;
-//     if (stat(file_foo, &st) == 0) {
-//         // Delete it if it exists
-//         unlink(file_foo);
-//     }
-
-//     // Rename original file
-//     ESP_LOGI(TAG, "Renombrando archivo %s a %s", file_hello, file_foo);
-//     if (rename(file_hello, file_foo) != 0) {
-//         ESP_LOGE(TAG, "Fallo renombrar archivo");
-//         return ret;
-//     }
-
-//     ret = sd_read_file(file_foo);
-//     if (ret != ESP_OK) {
-//         return ret;
-//     }
-
-//     // All done, unmount partition and disable SPI peripheral
-//     esp_vfs_fat_sdcard_unmount(mount_point, card);
-//     ESP_LOGI(TAG, "Tarjeta desmontada");
-
-//     //deinitialize the bus after all devices are removed
-//     spi_bus_free(host.slot);
-// }
+    //deinitialize the bus after all devices are removed
+    // spi_bus_free(host.slot);
+    return ESP_OK;
+}
 
 char *decompress_text_recursive(uint8_t uartNum, char *text, uint8_t reps) {
   char *p = text;

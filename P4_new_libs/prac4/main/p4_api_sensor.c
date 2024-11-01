@@ -85,7 +85,21 @@ static IRAM_ATTR bool i2c_slave_rx_done_callback(i2c_slave_dev_handle_t channel,
 static void listen_bus_and_transmit(void * pvParameters){
     i2c_slave_rx_done_event_data_t rx_data;
     uint8_t data_rd[2] ={0};
-    uint8_t aux_data[3] = {7,6,8};
+    uint8_t aux_data[5] = {0x27, 0x9F, 0, 0, 0};
+    rslt = bme280_set_sensor_mode(BME280_POWERMODE_FORCED, &dev);
+    if (rslt != BME280_OK) {
+      ESP_LOGE(TAG, "Error setting sensor mode: %d", rslt);
+    }
+    rslt = bme280_get_sensor_data(BME280_ALL, &bme_data, &dev);
+    if (rslt != BME280_OK) {
+      ESP_LOGE(TAG, "Error setting sensor mode: %d", rslt);
+    }
+    aux_data[2] =bme_data.temperature;
+    aux_data[3] =bme_data.pressure / 1000;
+    aux_data[4] =bme_data.humidity;
+    i2c_slave_transmit(slave_handler, aux_data, sizeof(aux_data), 500);
+    ESP_LOGI(TAG, "Temp %.2f C, Presión %.2f hPa, Humedad %.2f %%", bme_data.temperature,
+          bme_data.pressure, bme_data.humidity);
     while(1){
       
       
@@ -104,10 +118,10 @@ static void listen_bus_and_transmit(void * pvParameters){
           if (rslt != BME280_OK) {
             ESP_LOGE(TAG, "Error setting sensor mode: %d", rslt);
           }
-          aux_data[0] =bme_data.temperature;
-          aux_data[1] =bme_data.pressure / 1000;
-          aux_data[2] =bme_data.humidity;
-          i2c_slave_transmit(slave_handler, aux_data, 3, 1000);
+          aux_data[2] =bme_data.temperature;
+          aux_data[3] =bme_data.pressure - 100000;
+          aux_data[4] =bme_data.humidity;
+          i2c_slave_transmit(slave_handler, aux_data, 5, 500);
           ESP_LOGI(TAG, "Temp %.2f C, Presión %.2f hPa, Humedad %.2f %%", bme_data.temperature,
                 bme_data.pressure, bme_data.humidity);
         }
@@ -162,9 +176,7 @@ esp_err_t init_slave_mode() {
   i2c_slave_event_callbacks_t cbs = {
       .on_recv_done = i2c_slave_rx_done_callback,
   };
-  ESP_ERROR_CHECK(i2c_slave_register_event_callbacks(slave_handler, &cbs, s_receive_queue));
-
-  
+  ESP_ERROR_CHECK(i2c_slave_register_event_callbacks(slave_handler, &cbs, s_receive_queue));  
   return err;
 }
 
@@ -235,7 +247,7 @@ void bme280_initialize() {
   /* Recommended mode of operation: Indoor navigation */
   settings.osr_h = BME280_OVERSAMPLING_1X;
   settings.osr_p = BME280_OVERSAMPLING_16X;
-  settings.osr_t = BME280_OVERSAMPLING_2X;
+  settings.osr_t = BME280_OVERSAMPLING_1X;
   settings.filter = BME280_FILTER_COEFF_16;
   settings.standby_time = BME280_STANDBY_TIME_0_5_MS;
   rslt = bme280_set_sensor_settings(BME280_SEL_ALL_SETTINGS, &settings, &dev);
