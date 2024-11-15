@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Battleship Board</title>
+    <script>
+        // Function to handle click event and send coordinates as HTTP parameters
+        function handleCellClick(event, x, y) {
+            // Prevent default action if needed
+            event.preventDefault();
+
+            // Create the URL with coordinates as parameters
+            const url = `/battleship?x=${x}&y=${y}`;
+
+            // Log the URL to the console (you could use fetch or XMLHttpRequest to send data)
+            console.log("Sending request to:", url);
+
+            // Navigate to the constructed URL (this simulates an HTTP request)
+            window.location.href = url;
+        }
+    </script>
+</head>
+<body>
+    
+    
+        

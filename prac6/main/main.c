@@ -38,8 +38,8 @@ void app_main(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     wifi_init_softap();
-        ESP_LOGI(TAG, "Setup as AP initializing server...");
-        server = start_webserver(); 
+    ESP_LOGI(TAG, "Setup as AP initializing server...");
+    server = start_webserver(); 
     while (1) {
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
