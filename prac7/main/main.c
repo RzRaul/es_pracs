@@ -1,9 +1,12 @@
+
 /*
- * SPDX-FileCopyrightText: 2021-2023 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2021-2022 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Unlicense OR CC0-1.0
  */
 
+#include "driver/gpio.h"
+#include "driver/touch_pad.h"
 #include "esp_bt.h"
 #include "esp_bt_device.h"
 #include "esp_bt_main.h"
@@ -11,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_spp_api.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -23,27 +27,70 @@
 #include "sys/time.h"
 #include "time.h"
 
+#define LED_PIN 2
+#define BUFF_RECV_LEN 256
+
+EventGroupHandle_t event_group;
+const int bt_data_ready = BIT0;
+
+#define TOUCH_PAD_CHANNEL TOUCH_PAD_NUM4
+#define TOUCH_THRESHOLD 0x200 /* promedio obtenido de los experimentos */
+
+enum {
+    LED_ON = 97, // a
+    LED_OFF,
+    LED_STATE,
+    CAP_SENSOR_STATE,
+};
+
+typedef struct {
+    uint16_t filtered_value;
+    uint16_t raw_value;
+    uint8_t touch;
+} TOUCH_SENSOR_READ_t;
+
+uint32_t bt_connection_handle;
+bool led_state = 0;
+
 #define SPP_TAG "SPP_ACCEPTOR_DEMO"
 #define SPP_SERVER_NAME "SPP_SERVER"
-#define EXAMPLE_DEVICE_NAME "ESP_PALINDROMS"
-#define SPP_SHOW_DATA 0
-#define SPP_SHOW_SPEED 1
-#define SPP_SHOW_MODE SPP_SHOW_SPEED /*Choose show mode: show data or speed*/
+#define EXAMPLE_DEVICE_NAME "ESP_PALINDROMES"
 
 static const esp_spp_mode_t esp_spp_mode = ESP_SPP_MODE_CB;
 static const bool esp_spp_enable_l2cap_ertm = true;
 
-static struct timeval time_new, time_old;
-static long data_num = 0;
-
 static const esp_spp_sec_t sec_mask = ESP_SPP_SEC_AUTHENTICATE;
 static const esp_spp_role_t role_slave = ESP_SPP_ROLE_SLAVE;
+
+char data_recv[BUFF_RECV_LEN];
+
+void split_string(char *str, int *len, int *left, int *right) {
+    char *args[] = {0, 0};
+    char *aux = str;
+    int j = 0;
+    while (*str != '\n' && *str != '\r' && *str != '\0') {
+        if (*str == ',') {
+            args[j++] = str + 1;
+            *str = '\0';
+        }
+        str++;
+    }
+    *left = atoi(args[0]);
+    *right = atoi(args[1]);
+    *len = *right - *left;
+}
 
 int compare_func(const void *_a, const void *_b) {
     char *a, *b;
     a = (char *)_a;
     b = (char *)_b;
     return (*a - *b);
+}
+void copy_backwards(char *str_rev, char *str_og, int len) {
+    for (int i = 0; i < len; i++) {
+        str_rev[i] = str_og[len - i - 1];
+    }
+    str_rev[len] = '\n';
 }
 void print_backwards(char *str, int len) {
     for (int i = len - 1; i >= 0; i--)
@@ -56,12 +103,25 @@ void print_straight(char *str, int len) {
 }
 void print_permutes(char *str, char suffix, int index, int len) {
     char aux;
-    // printf("str->%s char->%c i->%d len->%d \n", str, suffix, index, len);
-    if (index == len - 1) {
+    if (index == len - 1 && (suffix || len > 1)) {
         print_straight(str, len);
         printf("%c", suffix);
         print_backwards(str, len);
         printf("\n");
+
+        char buff[128] = {0};
+        char *aux_ptr = buff;
+        memcpy(buff, str, len);
+        aux_ptr += len;
+        if (suffix)
+            *(aux_ptr++) = suffix;
+        copy_backwards(aux_ptr, str, len);
+        aux_ptr += len;
+        *(aux_ptr++) = '\n';
+
+        esp_spp_write(bt_connection_handle,
+                      suffix == 0 ? len * 2 + 1 : len * 2 + 2, (uint8_t *)buff);
+        vTaskDelay(10);
         return;
     }
 
@@ -82,7 +142,7 @@ void print_permutes(char *str, char suffix, int index, int len) {
 }
 
 static void generate_palindromes(char *sub_str, int len) {
-    printf("Los palíndromos de \"%s\" son:\n", sub_str);
+    printf("Los palíndromos de \"%s\" con %d chars son:\n", sub_str, len);
     qsort(sub_str, len, sizeof(char), &compare_func);
     sub_str[len] = 0;
     char repeated[64] = {0};
@@ -100,7 +160,6 @@ static void generate_palindromes(char *sub_str, int len) {
             uniques_len++;
         }
     }
-    // printf("r-> %s\nuniques->%s\n", repeated, uniques);
     if (!reps_len || !uniques_len)
         return;
     for (int i = 0; i < uniques_len; i++) {
@@ -111,12 +170,46 @@ static void generate_palindromes(char *sub_str, int len) {
         }
     }
 }
+static void init_led(void) {
+    gpio_reset_pin(LED_PIN);
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_PIN, 0);
 
-static void split_commands(char *buffer, char *sub_str, int *len) {
-    int aux;
-    sscanf(buffer, "%s,%d,%d", buffer, &aux, len);
-    sub_str = buffer + aux;
-    *len = *len - aux;
+    ESP_LOGI(SPP_TAG, "Init led completed");
+}
+
+static void init_touch_sensor(void) {
+    touch_pad_init();
+    touch_pad_set_voltage(TOUCH_HVOLT_2V7, TOUCH_LVOLT_0V5,
+                          TOUCH_HVOLT_ATTEN_1V);
+    touch_pad_config(TOUCH_PAD_CHANNEL, -1);
+    touch_pad_filter_start(10);
+}
+
+static void read_touch_sensor(TOUCH_SENSOR_READ_t *read) {
+    touch_pad_read_raw_data(TOUCH_PAD_CHANNEL, &read->raw_value);
+    touch_pad_read_filtered(TOUCH_PAD_CHANNEL, &read->filtered_value);
+
+    read->touch = (read->filtered_value < TOUCH_THRESHOLD) ? 1 : 0;
+}
+
+#define TOUCH_SENSOR_BUF_LEN 18
+#define TOUCH_SENSOR_RESP_LEN 16
+void process_bt_data(void *params) {
+
+    while (true) {
+        xEventGroupWaitBits(event_group, bt_data_ready, true, true,
+                            portMAX_DELAY);
+
+        // Process the palindromes
+        int left, right, len;
+        char substr[100] = {0};
+        char buff[128] = {0};
+        split_string(data_recv, &len, &left, &right);
+        // sscanf(data_recv, "%s,%d,%d", substr, &left, &right);
+        len = right - left + 1;
+        generate_palindromes(data_recv + left, len);
+    }
 }
 
 static char *bda2str(uint8_t *bda, char *str, size_t size) {
@@ -128,18 +221,6 @@ static char *bda2str(uint8_t *bda, char *str, size_t size) {
     sprintf(str, "%02x:%02x:%02x:%02x:%02x:%02x", p[0], p[1], p[2], p[3], p[4],
             p[5]);
     return str;
-}
-
-static void print_speed(void) {
-    float time_old_s = time_old.tv_sec + time_old.tv_usec / 1000000.0;
-    float time_new_s = time_new.tv_sec + time_new.tv_usec / 1000000.0;
-    float time_interval = time_new_s - time_old_s;
-    float speed = data_num * 8 / time_interval / 1000.0;
-    ESP_LOGI(SPP_TAG, "speed(%fs ~ %fs): %f kbit/s", time_old_s, time_new_s,
-             speed);
-    data_num = 0;
-    time_old.tv_sec = time_new.tv_sec;
-    time_old.tv_usec = time_new.tv_usec;
 }
 
 static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
@@ -172,7 +253,7 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
                      "ESP_SPP_START_EVT handle:%" PRIu32 " sec_id:%d scn:%d",
                      param->start.handle, param->start.sec_id,
                      param->start.scn);
-            esp_bt_gap_set_device_name(EXAMPLE_DEVICE_NAME);
+            esp_bt_dev_set_device_name(EXAMPLE_DEVICE_NAME);
             esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
                                      ESP_BT_GENERAL_DISCOVERABLE);
         } else {
@@ -184,31 +265,13 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
         ESP_LOGI(SPP_TAG, "ESP_SPP_CL_INIT_EVT");
         break;
     case ESP_SPP_DATA_IND_EVT:
-        /*
-         * We only show the data in which the data length is less than 128
-         * here. If you want to print the data and the data rate is high, it
-         * is strongly recommended to process them in other lower priority
-         * application task rather than in this callback directly. Since the
-         * printing takes too much time, it may stuck the Bluetooth stack
-         * and also have a effect on the throughput!
-         */
-        ESP_LOGI(SPP_TAG, "ESP_SPP_DATA_IND_EVT len:%d handle:%" PRIu32,
-                 param->data_ind.len, param->data_ind.handle);
-        if (param->data_ind.len < 128) {
-            esp_log_buffer_hex("", param->data_ind.data, param->data_ind.len);
-            char *sub_str;
-            int r, l;
-            sscanf((char *)param->data_ind.data, "%s,%d,%d");
-
-            ESP_LOGI(SPP_TAG, "%s %d", param->data_ind.data,
-                     param->data_ind.len);
-            generate_palindromes((char *)param->data_ind.data + l, r - l);
+        uint16_t data_len = param->data_ind.len;
+        if (data_len > BUFF_RECV_LEN) {
+            data_len = BUFF_RECV_LEN;
         }
-        gettimeofday(&time_new, NULL);
-        data_num += param->data_ind.len;
-        if (time_new.tv_sec - time_old.tv_sec >= 3) {
-            print_speed();
-        }
+        memcpy(data_recv, param->data_ind.data, data_len);
+        bt_connection_handle = param->data_ind.handle;
+        xEventGroupSetBits(event_group, bt_data_ready);
         break;
     case ESP_SPP_CONG_EVT:
         ESP_LOGI(SPP_TAG, "ESP_SPP_CONG_EVT");
@@ -222,7 +285,6 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
                  ", rem_bda:[%s]",
                  param->srv_open.status, param->srv_open.handle,
                  bda2str(param->srv_open.rem_bda, bda_str, sizeof(bda_str)));
-        gettimeofday(&time_old, NULL);
         break;
     case ESP_SPP_SRV_STOP_EVT:
         ESP_LOGI(SPP_TAG, "ESP_SPP_SRV_STOP_EVT");
@@ -269,23 +331,6 @@ void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
         break;
     }
 
-#if (CONFIG_EXAMPLE_SSP_ENABLED == true)
-    case ESP_BT_GAP_CFM_REQ_EVT:
-        ESP_LOGI(SPP_TAG,
-                 "ESP_BT_GAP_CFM_REQ_EVT Please compare the numeric value: "
-                 "%" PRIu32,
-                 param->cfm_req.num_val);
-        esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
-        break;
-    case ESP_BT_GAP_KEY_NOTIF_EVT:
-        ESP_LOGI(SPP_TAG, "ESP_BT_GAP_KEY_NOTIF_EVT passkey:%" PRIu32,
-                 param->key_notif.passkey);
-        break;
-    case ESP_BT_GAP_KEY_REQ_EVT:
-        ESP_LOGI(SPP_TAG, "ESP_BT_GAP_KEY_REQ_EVT Please enter passkey!");
-        break;
-#endif
-
     case ESP_BT_GAP_MODE_CHG_EVT:
         ESP_LOGI(SPP_TAG, "ESP_BT_GAP_MODE_CHG_EVT mode:%d bda:[%s]",
                  param->mode_chg.mode,
@@ -302,6 +347,12 @@ void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
 
 void app_main(void) {
     char bda_str[18] = {0};
+
+    init_led();
+    init_touch_sensor();
+    event_group = xEventGroupCreate();
+    xTaskCreate(process_bt_data, "process_bt_data", 4096, NULL, 10, NULL);
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -314,41 +365,37 @@ void app_main(void) {
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     if ((ret = esp_bt_controller_init(&bt_cfg)) != ESP_OK) {
-        ESP_LOGE(SPP_TAG, "%s initialize controller failed: %s", __func__,
+        ESP_LOGE(SPP_TAG, "%s initialize controller failed: %s\n", __func__,
                  esp_err_to_name(ret));
         return;
     }
 
     if ((ret = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT)) != ESP_OK) {
-        ESP_LOGE(SPP_TAG, "%s enable controller failed: %s", __func__,
+        ESP_LOGE(SPP_TAG, "%s enable controller failed: %s\n", __func__,
                  esp_err_to_name(ret));
         return;
     }
 
-    esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
-#if (CONFIG_EXAMPLE_SSP_ENABLED == false)
-    bluedroid_cfg.ssp_en = false;
-#endif
-    if ((ret = esp_bluedroid_init_with_cfg(&bluedroid_cfg)) != ESP_OK) {
-        ESP_LOGE(SPP_TAG, "%s initialize bluedroid failed: %s", __func__,
+    if ((ret = esp_bluedroid_init()) != ESP_OK) {
+        ESP_LOGE(SPP_TAG, "%s initialize bluedroid failed: %s\n", __func__,
                  esp_err_to_name(ret));
         return;
     }
 
     if ((ret = esp_bluedroid_enable()) != ESP_OK) {
-        ESP_LOGE(SPP_TAG, "%s enable bluedroid failed: %s", __func__,
+        ESP_LOGE(SPP_TAG, "%s enable bluedroid failed: %s\n", __func__,
                  esp_err_to_name(ret));
         return;
     }
 
     if ((ret = esp_bt_gap_register_callback(esp_bt_gap_cb)) != ESP_OK) {
-        ESP_LOGE(SPP_TAG, "%s gap register failed: %s", __func__,
+        ESP_LOGE(SPP_TAG, "%s gap register failed: %s\n", __func__,
                  esp_err_to_name(ret));
         return;
     }
 
     if ((ret = esp_spp_register_callback(esp_spp_cb)) != ESP_OK) {
-        ESP_LOGE(SPP_TAG, "%s spp register failed: %s", __func__,
+        ESP_LOGE(SPP_TAG, "%s spp register failed: %s\n", __func__,
                  esp_err_to_name(ret));
         return;
     }
@@ -359,17 +406,10 @@ void app_main(void) {
         .tx_buffer_size = 0, /* Only used for ESP_SPP_MODE_VFS mode */
     };
     if ((ret = esp_spp_enhanced_init(&bt_spp_cfg)) != ESP_OK) {
-        ESP_LOGE(SPP_TAG, "%s spp init failed: %s", __func__,
+        ESP_LOGE(SPP_TAG, "%s spp init failed: %s\n", __func__,
                  esp_err_to_name(ret));
         return;
     }
-
-#if (CONFIG_EXAMPLE_SSP_ENABLED == true)
-    /* Set default parameters for Secure Simple Pairing */
-    esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
-    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_IO;
-    esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
-#endif
 
     /*
      * Set default parameters for Legacy Pairing
